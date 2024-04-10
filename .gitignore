@@ -4,3 +4,4 @@
 /build-win
 /compile_commands.json
 /grader
+/.vscode
