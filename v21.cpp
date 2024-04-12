@@ -4,6 +4,8 @@
 #include "v21.hpp"
 
 constexpr float BANDPASS_SMOOTHING = 0.99;
+constexpr float CLOCKFILTER_SMOOTHING = 0.9999;
+constexpr int CLOCKFILTER_DELAY = 200;
 
 V21_RX::V21_RX(float omega_mark, float omega_space, std::function<void(const unsigned int *, unsigned int)> get_digital_samples) :
     omega_mark(omega_mark),
@@ -13,23 +15,22 @@ V21_RX::V21_RX(float omega_mark, float omega_space, std::function<void(const uns
     // Filling buffers with "empty" values
     for (int i = 0; i < SAMPLES_PER_SYMBOL; i++)
         this->sample_buffer.push_front(0.f);
+    for (int i = 0; i < CLOCKFILTER_DELAY; i++)
+        this->decision_buffer.push_front(0.f);
     this->vspace_r_buffer = 0.f;
     this->vspace_i_buffer = 0.f;
     this->vmark_r_buffer = 0.f;
     this->vmark_i_buffer = 0.f;
-    this->raw_decision_buffer[0] = 0.f;
-    this->raw_decision_buffer[1] = 0.f;
-    this->filtered_decision_buffer[0] = 0.f;
-    this->filtered_decision_buffer[1] = 0.f;
-    this->low_difference_counter = 0;
+    this->clock_filter_buffer[0] = 0.f;
+    this->clock_filter_buffer[1] = 0.f;
+    this->last_clock = 0.f;
 
-    // Low-pass Butterworth filter generated with scipy.signal
-    this->lp_numerator[0] = 0.00037506961629696616f;
-    this->lp_numerator[1] = 0.0007501392325939323f;
-    this->lp_numerator[2] = 0.00037506961629696616f;
-    this->lp_denominator[0] = 1.f;
-    this->lp_denominator[1] = -1.9444776577670935f;
-    this->lp_denominator[2] = 0.9459779362322813f;
+    this->high_digital_samples = new unsigned int[SAMPLES_PER_SYMBOL];
+    this->low_digital_samples = new unsigned int[SAMPLES_PER_SYMBOL];
+    for (int i = 0; i < SAMPLES_PER_SYMBOL; i++) {
+        this->high_digital_samples[i] = 1;
+        this->low_digital_samples[i] = 0;
+    }
 
     // Precomputing sines and cosines
     this->rl_cos_space =
@@ -51,9 +52,13 @@ V21_RX::V21_RX(float omega_mark, float omega_space, std::function<void(const uns
     this->r_sin_mark = BANDPASS_SMOOTHING * sin(omega_mark * SAMPLING_PERIOD); 
 };
 
+V21_RX::~V21_RX() {
+    delete[] this->high_digital_samples;
+    delete[] this->low_digital_samples;
+}
+
 void V21_RX::demodulate(const float *in_analog_samples, unsigned int n)
 {
-    unsigned int digital_samples[n];
     const int L = SAMPLES_PER_SYMBOL;
 
     for (int i = 0; i < n; i++) {
@@ -68,60 +73,44 @@ void V21_RX::demodulate(const float *in_analog_samples, unsigned int n)
         float vmark_i = -this->rl_sin_mark * this->sample_buffer[L] + this->r_cos_mark * vmark_i_buffer
                             + this->r_sin_mark * vmark_r_buffer;
 
-        float raw_decision = vmark_r * vmark_r + vmark_i * vmark_i -
+        float decision = vmark_r * vmark_r + vmark_i * vmark_i -
                                 vspace_r * vspace_r - vspace_i * vspace_i; 
+        this->decision_buffer.push_front(decision);
+        this->clock_sample_buffer.push(this->decision_buffer[CLOCKFILTER_DELAY]);
 
-        // a[0]*y[n] = b[0]*x[n] + b[1]*x[n-1] + ... + b[M]*x[n-M]
-        //               - a[1]*y[n-1] - ... - a[N]*y[n-N]
-        float filtered_decision = 
-            this->lp_numerator[0] * raw_decision
-            + this->lp_numerator[1] * this->raw_decision_buffer[0]
-            + this->lp_numerator[2] * this->raw_decision_buffer[1]
-            - this->lp_denominator[1] * this->filtered_decision_buffer[0]
-            - this->lp_denominator[2] * this->filtered_decision_buffer[1];
-        filtered_decision /= this->lp_denominator[0];
+        float c = abs(decision);
+        float clock_filter = 
+            (1 - CLOCKFILTER_SMOOTHING) * c 
+            + 2 * CLOCKFILTER_SMOOTHING * cos((2.f * M_PI * BAUD_RATE) / SAMPLING_RATE) * this->clock_filter_buffer[0]
+            - CLOCKFILTER_SMOOTHING * CLOCKFILTER_SMOOTHING * this->clock_filter_buffer[1];
+        float clock_val = clock_filter - this->clock_filter_buffer[1];
 
-        switch (this->state) {
-            case IDLE:
-                if (abs(filtered_decision) > 120) {
-                    digital_samples[i] = filtered_decision > 0 ? 1 : 0;
-                    this->low_difference_counter = 0;
-                    this->state = CARRIER_DETECTED;
-                } else
-                    digital_samples[i] = 1;
-
-                break;
-
-            case CARRIER_DETECTED:
-                if (abs(filtered_decision) < 60)
-                    this->low_difference_counter++;
-                else
-                    this->low_difference_counter = 0;
-
-                if (this->low_difference_counter >= 50) {
-                    digital_samples[i] = 1;
-                    this->state = IDLE;
-                } else
-                    digital_samples[i] = filtered_decision > 0 ? 1 : 0;
-
-                break;
-
-            default: break;
+        if (last_clock < 0 && clock_val >= 0) {
+            // Symbol frontier
+            float avg = 0.f;
+            unsigned int size = this->clock_sample_buffer.size();
+            for (int i = 0; i < size; i++) { 
+                avg += this->clock_sample_buffer.front();
+                this->clock_sample_buffer.pop();
+            }
+            
+            if (avg >= 0)
+                get_digital_samples(this->high_digital_samples, L);
+            else
+                get_digital_samples(this->low_digital_samples, L);
         }
 
         // Updating buffers 
         this->sample_buffer.pop_back();
+        this->decision_buffer.pop_back();
         this->vspace_r_buffer = vspace_r;
         this->vspace_i_buffer = vspace_i;
         this->vmark_r_buffer = vmark_r;
         this->vmark_i_buffer = vmark_i;
-        this->raw_decision_buffer[1] = this->raw_decision_buffer[0];
-        this->raw_decision_buffer[0] = raw_decision;
-        this->filtered_decision_buffer[1] = this->filtered_decision_buffer[0];
-        this->filtered_decision_buffer[0] = filtered_decision;
+        this->clock_filter_buffer[1] = this->clock_filter_buffer[0];
+        this->clock_filter_buffer[0] = clock_filter;
+        this->last_clock = clock_val;
     }
-
-    get_digital_samples(digital_samples, n);
 }
 
 void V21_TX::modulate(const unsigned int *in_digital_samples, float *out_analog_samples, unsigned int n)
