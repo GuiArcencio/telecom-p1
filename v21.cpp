@@ -1,11 +1,10 @@
-#include <cstdio>
 #include <math.h>
 #include <numbers>
 #include "v21.hpp"
 
 constexpr float BANDPASS_SMOOTHING = 0.99;
 constexpr float CLOCKFILTER_SMOOTHING = 0.9999;
-constexpr int CLOCKFILTER_DELAY = 200;
+constexpr int CLOCKFILTER_DELAY = 40;
 
 V21_RX::V21_RX(float omega_mark, float omega_space, std::function<void(const unsigned int *, unsigned int)> get_digital_samples) :
     omega_mark(omega_mark),
@@ -24,6 +23,8 @@ V21_RX::V21_RX(float omega_mark, float omega_space, std::function<void(const uns
     this->clock_filter_buffer[0] = 0.f;
     this->clock_filter_buffer[1] = 0.f;
     this->last_clock = 0.f;
+    this->clock_sample_buffer = 0.f;
+    this->clock_sample_count = 0;
 
     this->high_digital_samples = new unsigned int[SAMPLES_PER_SYMBOL];
     this->low_digital_samples = new unsigned int[SAMPLES_PER_SYMBOL];
@@ -76,7 +77,9 @@ void V21_RX::demodulate(const float *in_analog_samples, unsigned int n)
         float decision = vmark_r * vmark_r + vmark_i * vmark_i -
                                 vspace_r * vspace_r - vspace_i * vspace_i; 
         this->decision_buffer.push_front(decision);
-        this->clock_sample_buffer.push(this->decision_buffer[CLOCKFILTER_DELAY]);
+
+        this->clock_sample_buffer += this->decision_buffer[CLOCKFILTER_DELAY];
+        this->clock_sample_count++;
 
         float c = abs(decision);
         float clock_filter = 
@@ -85,19 +88,17 @@ void V21_RX::demodulate(const float *in_analog_samples, unsigned int n)
             - CLOCKFILTER_SMOOTHING * CLOCKFILTER_SMOOTHING * this->clock_filter_buffer[1];
         float clock_val = clock_filter - this->clock_filter_buffer[1];
 
-        if (last_clock < 0 && clock_val >= 0) {
+        if (last_clock < 0.f && clock_val >= 0.f) {
             // Symbol frontier
-            float avg = 0.f;
-            unsigned int size = this->clock_sample_buffer.size();
-            for (int i = 0; i < size; i++) { 
-                avg += this->clock_sample_buffer.front();
-                this->clock_sample_buffer.pop();
-            }
+            this->clock_sample_buffer /= this->clock_sample_count;
             
-            if (avg >= 0)
-                get_digital_samples(this->high_digital_samples, L);
-            else
+            if (this->clock_sample_buffer < 0.f)
                 get_digital_samples(this->low_digital_samples, L);
+            else
+                get_digital_samples(this->high_digital_samples, L);
+
+            this->clock_sample_buffer = 0.f;
+            this->clock_sample_count = 0;
         }
 
         // Updating buffers 

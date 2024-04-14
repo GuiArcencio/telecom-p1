@@ -3,7 +3,6 @@
 
 #include <functional>
 #include <deque>
-#include <queue>
 #include "config.hpp"
 
 class V21_RX
@@ -23,7 +22,8 @@ private:
     float clock_filter_buffer[2];
     float last_clock;
     std::deque<float> decision_buffer;
-    std::queue<float> clock_sample_buffer;
+    float clock_sample_buffer;
+    int clock_sample_count;
 
     unsigned int *high_digital_samples, *low_digital_samples;
 
